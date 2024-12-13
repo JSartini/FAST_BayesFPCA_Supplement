@@ -34,9 +34,6 @@ message("I have ", ncores, " cores available")
 nworkers = length(parallelly::availableWorkers())
 message("I have ", nworkers, " workers available")
 
-system('nproc')
-system('free -h')
-
 for(x in 1:n_sim){
   print(paste0("Iteration: ", x))
   
