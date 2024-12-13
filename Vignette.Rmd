@@ -1,0 +1,283 @@
+---
+title: "Fast BayesFPCA Vignette"
+author: "Joe Sartini"
+date: "2024-11-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, results=FALSE, message=FALSE}
+source("FPCA_Processing/Libs.R")
+source("FPCA_Processing/Extract_FE.R")
+source("FPCA_Processing/Extract_EF.R")
+source("FPCA_Processing/Extract_Scores.R")
+```
+
+## Read in the NHANES Accelerometry Data
+
+For this brief example analysis, we leverage the objective physical activity data from wrist-worn accelerometry collected as part of NHANES 2011-2014. This dataset is made publicly available as part of ["Functional Data Analysis with R"](https://functionaldataanalysis.org) and can be downloaded from the accompanying website. We subsample the data to 20-minute averages as a pre-processing step and take a random subsample of 1000 individuals (still likely sufficient for an exploratory FPCA) for the sake of time.
+
+```{r data_read, results=FALSE, message=FALSE}
+data_path = "http://www.ciprianstats.org/sites/default/files/nhanes/nhanes_fda_with_r.rds"
+download.file(data_path, "nhanes.rds", mode = "wb")
+accel_data = readRDS("nhanes.rds")
+file.remove("nhanes.rds")
+
+unAsIs <- function(X) {
+  if("AsIs" %in% class(X)) {
+    class(X) <- class(X)[-match("AsIs", class(X))]
+  }
+  X
+}
+
+chosen_idxs = sample(1:nrow(accel_data), 1000)
+accel_mat = unAsIs(accel_data$MIMS)[chosen_idxs, ]
+Day_Minutes = 1440
+window_size = 20 # In minutes
+accel_df = data.frame(accel_mat)
+colnames(accel_df) = 1:Day_Minutes
+accel_df$ID = accel_data$SEQN[chosen_idxs]
+accel_df = accel_df %>%
+  pivot_longer(-c(ID), names_to = "MoD", values_to = "MIMS") %>%
+  mutate(Window = (as.numeric(MoD) - 1) %/% window_size) %>%
+  group_by(ID, Window) %>%
+  summarize(MIMS = mean(MIMS))
+```
+
+Now that we have the data, we perform quick visualizations to get an idea of the types of patterns present. We first randomly select 5 participant's MIMS (monitor-independent movement summary) curves.
+
+```{r data_vis1}
+chosen_ids = sample(unique(accel_df$ID), 5)
+plot_df = accel_df %>%
+  filter(ID %in% chosen_ids) %>%
+  mutate(HoD = (Window * window_size)/60)
+
+plot_df %>%
+  ggplot(aes(x = HoD, y = MIMS, group = ID)) + 
+  geom_line() +
+  theme_bw() + 
+  labs(x = "Hour of the Day", y = "MIMS")
+```
+
+We can alternatively visualize the entire population using a heatmap structure, where each row is a participant and darker colors correspond to higher activity levels (as in ["Functional Data Analysis with R"](https://functionaldataanalysis.org)).
+
+```{r data_vis2}
+accel_df %>%
+  mutate(HoD = (Window * window_size)/60,
+         ID = factor(ID)) %>%
+  ggplot(aes(x = HoD, y = ID)) + 
+  geom_tile(aes(color = MIMS)) +
+  theme_bw() + 
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), 
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank()) +
+  scale_color_gradient(low = "white", high = "black") + 
+  labs(x = "Hour of the Day", y = "Participant")
+```
+
+## Applying Fast BayesFPCA
+
+We first retrieve the matrix representation of the full dataset using the appropriate wrangling. We then define the constants, using $Q = 25, K = 5,$ and $M = 96$ due to our averaging of MIMS every 15 minutes. We choose $K = 5$ due to preliminary analyses indicating that more than $80$\% of the variability is captured in the first 5 FPCs. It is important to note that we fit the model on the domain $[0,1]$ for computational reasons, but the results are rescaled to the original domain post-hoc. We then generate the basis $\mathbf{B}$ and penalty $\mathbf{P}_{\alpha}$, collating all of these results to be fed to STAN as arguments. 
+
+```{r model_args}
+# Place data in wide, matrix format
+Y_mat = accel_df %>% 
+  ungroup() %>%
+  pivot_wider(names_from = Window, values_from = MIMS) %>%
+  select(-c(ID)) %>% as.matrix()
+
+# Define constants
+spline_dim = 15
+npc = 5
+M = ncol(Y_mat)
+domain = seq(0,1,length.out=M)
+
+# Generate orthonormal spline basis and penalty
+raw_splines = bSpline(domain, df = spline_dim, intercept = T)
+raw_derivs = deriv(raw_splines, 2)
+  
+B = eigen(raw_splines %*% t(raw_splines))$vectors[,1:spline_dim]
+basis_svd = svd(raw_splines)
+pi_splines = basis_svd$v %*% diag(basis_svd$d^-1) %*% t(basis_svd$u)
+transform = pi_splines %*% B
+Bpp = raw_derivs %*% transform
+  
+p0 = (1/Day_Minutes) * t(B) %*% B
+p1 = (1/Day_Minutes) * t(Bpp) %*% Bpp
+Palpha = 0.1*p0 + 0.9*p1
+
+# Collate list of arguments
+data_list = list(N = nrow(Y_mat), M = M, Q = spline_dim, K = npc,
+                 Y = Y_mat, B = B, P = Palpha)
+```
+
+Prior to fitting Fast BayesFPCA, we fit a standard FPCA using the FACE implementation, using the variance components and fixed effects to provide a reasonable sampling initiation. 
+
+```{r fit_FPCA, results=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+# Fit preliminary model using FACE for reasonable sampling initialization
+stage_mod = fpca.face(Y_mat, knots = spline_dim, npc = npc, var = T)
+scaling = diag(t(stage_mod$efunctions) %*% stage_mod$efunctions)[1:npc] 
+init_list = list(w_mu = coef(lm(stage_mod$mu ~ B - 1)),
+                 lambda = rev(stage_mod$evalues[1:npc]*scaling), 
+                 sigma2 = stage_mod$sigma2) 
+
+fit_mod = stan(file = "STAN_Files/FPCA/FAST.stan",
+               data = data_list, 
+               chains = 4, 
+               cores = 4, 
+               warmup = 2500, 
+               iter = 3000, 
+               init = list(init_list, init_list, 
+                           init_list, init_list), 
+               control = list(stepsize_jitter = 0.25))
+```
+
+With this model fit, we can now extract the estimated model components, fixed effects $\mu(t)$, eigenfunctions $\phi_k(t)$, scores $\xi_{ik}(t)$, and eigenvalues $\lambda_k$. We align the score and eigenfunction samples with the first sample to ensure consistent sign, given that the sign is non-identifiable by the FPCA definition.
+
+```{r extract_components, results=FALSE, message=FALSE}
+samples = extract(fit_mod)
+vis_domain = (0:(Day_Minutes/window_size-1))*window_size/60
+
+# Mu samples
+mu_func = fast_FE(samples$w_mu, B, vis_domain)
+    
+# EF samples
+preproc = fast_align(samples$Scores, samples$Psi, B)
+EF_objs = fast_EF(samples$Psi, B, vis_domain,  
+                  preproc$Ord, preproc$Flip)
+    
+EF_estimate = EF_objs$Mean
+EF_sample = EF_objs$Samples
+
+Score_samples = fast_scores(samples$Scores, preproc$Ord, preproc$Flip)
+EF_samples = Score_samples %>%
+  group_by(EFNum, Sample) %>%
+  summarize(EVal = var(Score)) %>%
+  ungroup()
+```
+
+It is now straightforward to visualize the model components. We begin with the fixed effects mean $\mu(t)$, with the estimate, equal-tail 95\% credible interval, and 3 posterior samples displayed. 
+
+```{r fe_vis}
+chosen_samples = sample(mu_func$Sample, 3)
+
+func_est = mu_func %>%
+  group_by(Arg) %>%
+  summarize(Estimate = mean(Mu))
+  
+func_band = mu_func %>%
+  group_by(Arg) %>%
+  summarize(Lower = quantile(Mu, probs = c(0.025)), 
+            Upper = quantile(Mu, probs = c(0.975)))
+
+func_samples = mu_func %>%
+  filter(Sample %in% chosen_samples) 
+
+func_est %>%
+  ggplot(aes(x = Arg)) + 
+  geom_line(aes(y = Estimate)) + 
+  geom_line(data = func_samples, aes(y = Mu, group = Sample), color = "red", alpha = 0.5) + 
+  geom_ribbon(data = func_band, aes(ymin = Lower, ymax = Upper), alpha = 0.1) + 
+  theme_bw() + 
+  labs(x = "Hour of the Day", y = parse(text = "mu(t)~Estimate"))
+```
+
+We can similarly visualize the samples of eigenfunctions $\phi_k(t)$, again including the estimate, equal-tail 95\% credible interval, and 3 posterior samples in red. 
+
+```{r ef_vis, message=FALSE, fig.width=12}
+func_est = EF_estimate %>%
+  mutate(EFLab = paste0("phi[", substring(EFNum, 4), "](t)")) %>%
+  select(-c(EFNum))
+
+func_band = EF_sample %>%
+  mutate(EFLab = paste0("phi[", substring(EFNum, 4), "](t)")) %>%
+  select(-c(EFNum)) %>%
+  group_by(EFLab, Arg) %>%
+  summarize(Lower = quantile(EigFunc, probs = c(0.025)),
+            Upper = quantile(EigFunc, probs = c(0.975)))
+
+func_sample = EF_sample %>%
+  mutate(EFLab = paste0("phi[", substring(EFNum, 4), "](t)")) %>%
+  filter(Sample %in% chosen_samples)
+
+func_est %>%
+  ggplot(aes(x = Arg)) + 
+  geom_line(aes(y = Estimate)) +
+  geom_line(data = func_sample, aes(y = EigFunc, group = Sample), color = "red", alpha = 0.5) +
+  geom_ribbon(data = func_band, aes(ymin = Lower, ymax = Upper), alpha = 0.1) + 
+  facet_grid(.~EFLab, labeller = label_parsed) + 
+  theme_bw() + 
+  labs(x = "Hour of the Day", y = "Eigenfunction Estimate")
+```
+
+
+We can also evaluate the variability decomposition by plotting the estimated eigenvalues $\lambda_k$ sequentially with their equal-tail 95\% credible intervals.
+
+```{r ev_vis}
+labs = paste0("phi[", 1:npc, "](t)")
+names(labs) = paste0("EF ", 1:npc)
+
+EF_samples %>%
+  group_by(EFNum) %>%
+  summarize(Lower = quantile(EVal, probs = c(0.025)), 
+            Upper = quantile(EVal, probs = c(0.975)), 
+            Est = mean(EVal)) %>%
+  ggplot(aes(x = EFNum, y = Est, group = "")) +
+  geom_point() + 
+  geom_line() + 
+  geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0.5) + 
+  scale_x_discrete(labels = parse(text = labs)) + 
+  labs(x = "Eigenfunction", y = "Eigenvalue") + 
+  theme_bw()
+```
+
+Finally, we demonstrate a method for assessing convergence of sampling for this model. In particular, we visualize the trace of each eigenfunction at fixed points in the temporal domain ($t = x,y,$ and $z$ minutes of the day). These are visualized below.
+
+```{r trace_plots, fig.width=12}
+chosen_args = vis_domain[c(12,48,84)]
+
+anchor_EF = EF_sample %>%
+  filter(Sample == 1) %>%
+  pivot_wider(names_from = Arg, values_from = EigFunc) %>%
+  select(-c(Sample, EFNum)) %>%
+  as.matrix() %>% t()
+
+psi_samples = extract(fit_mod, permuted = F, pars = "Psi")
+score_samples = extract(fit_mod, permuted = F, pars = "Scores")
+n_chains = dim(psi_samples)[2]
+n_samples = dim(psi_samples)[1]
+  
+samples = map(1:n_chains, function(z){
+  chain_psi = psi_samples[,z,]
+  dim(chain_psi) = c(n_samples, spline_dim, npc)
+  chain_scores = score_samples[,z,]
+  n_scores = dim(chain_scores)[2]
+  dim(chain_scores) = c(n_samples, n_scores/npc, npc)
+    
+  preproc = fast_align(chain_scores, chain_psi, B, 
+                       anchor = anchor_EF)
+  EigFunc = fast_EF(chain_psi, B, vis_domain,
+                    preproc$Ord, preproc$Flip)$Samples
+  EigFunc$Chain = z
+    
+  return(EigFunc)
+}) %>% list_rbind()
+
+samples %>%
+  filter(Arg %in% chosen_args) %>%
+  mutate(Arg = factor(paste0("t==", Arg), levels = paste0("t==", chosen_args)), 
+         Chain = as.factor(Chain), 
+         EFLab = paste0("phi[", substring(EFNum, 4), "](t)")) %>%
+  ggplot(aes(x = Sample, y = EigFunc)) + 
+  geom_point(aes(color = Chain)) + 
+  facet_grid(Arg~EFLab, scales = "free_y", labeller = label_parsed) + 
+  labs(x = "Sample", y = "Eigenfunction Evaluation") + 
+  theme_bw()
+```
+
+
+
+
